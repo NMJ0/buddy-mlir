@@ -34,6 +34,53 @@ using namespace buddy;
 //===----------------------------------------------------------------------===//
 
 namespace {
+static Value tryRecoverInt8Source(Value value) {
+  auto memrefType = dyn_cast<MemRefType>(value.getType());
+  if (!memrefType || memrefType.getElementType().getIntOrFloatBitWidth() != 32)
+    return Value();
+
+  auto alloc = value.getDefiningOp<memref::AllocOp>();
+  if (!alloc)
+    return Value();
+
+  linalg::GenericOp generic;
+  for (Operation *user : alloc->getUsers()) {
+    auto maybeGeneric = dyn_cast<linalg::GenericOp>(user);
+    if (!maybeGeneric)
+      continue;
+    if (maybeGeneric.getNumDpsInputs() != 1 || maybeGeneric.getNumDpsInits() != 1)
+      continue;
+    if (maybeGeneric.getDpsInitOperand(0)->get() != value)
+      continue;
+    if (generic)
+      return Value();
+    generic = maybeGeneric;
+  }
+  if (!generic || generic.getNumDpsInputs() != 1 || generic.getNumDpsInits() != 1)
+    return Value();
+
+  Block &block = generic->getRegion(0).front();
+  if (!llvm::hasSingleElement(block.without_terminator()))
+    return Value();
+
+  auto extsi = dyn_cast<arith::ExtSIOp>(block.front());
+  if (!extsi)
+    return Value();
+
+  auto yield = dyn_cast<linalg::YieldOp>(block.getTerminator());
+  if (!yield || yield.getValues().size() != 1 || yield.getValues().front() != extsi.getResult())
+    return Value();
+
+  auto srcType = dyn_cast<MemRefType>(generic.getDpsInputOperand(0)->get().getType());
+  if (!srcType || srcType.getElementType().getIntOrFloatBitWidth() != 8)
+    return Value();
+
+  if (srcType.getRank() != memrefType.getRank() || srcType.getShape() != memrefType.getShape())
+    return Value();
+
+  return generic.getDpsInputOperand(0)->get();
+}
+
 class MatmulLowering : public OpRewritePattern<linalg::MatmulOp> {
 public:
   explicit MatmulLowering(MLIRContext *context, std::string accType)
@@ -47,6 +94,13 @@ public:
     Value input0 = inputs[0];
     Value input1 = inputs[1];
     Value output0 = ouputs[0];
+    // Torch-MLIR commonly widens int8 inputs to int32 with a linalg.generic
+    // sign-extension before matmul when the result is int32. Recover the
+    // original int8 buffers so Python users can keep a natural frontend.
+    if (Value recovered = tryRecoverInt8Source(input0))
+      input0 = recovered;
+    if (Value recovered = tryRecoverInt8Source(input1))
+      input1 = recovered;
     MemRefType input0Type = dyn_cast<MemRefType>(input0.getType());
     MemRefType input1Type = dyn_cast<MemRefType>(input1.getType());
     MemRefType outputType = dyn_cast<MemRefType>(output0.getType());
@@ -90,11 +144,19 @@ public:
       oVal = rewriter.create<memref::CollapseShapeOp>(loc, output0, reassoc);
       biasVal = rewriter.create<memref::CollapseShapeOp>(loc, bias, reassoc);
     }
+    // Set full_C=true when output is i32 so Gemmini DMA writes to DRAM
+    // (not the tagged scratchpad address that causes segfault).
+    bool fullC = outputType.getElementType().getIntOrFloatBitWidth() == 32;
 
     rewriter.replaceOpWithNewOp<gemmini::TileMatMulOp>(
-        matMulOp, aVal, bVal, oVal, biasVal, /*aScaleFactor = */ scale1,
-        /*bScaleFactor = */ scale1, /*dScaleFactor = */ scale1, /*act = */ 0,
-        /*accScale = */ scale1, /*bertScale = */ scale0);
+        matMulOp, aVal, bVal, oVal, biasVal,
+        /*aScaleFactor=*/scale1, /*bScaleFactor=*/scale1,
+        /*dScaleFactor=*/scale1, /*act=*/0,
+        /*accScale=*/scale1, /*bertScale=*/scale0,
+        /*repeatingBias=*/false, /*aTranspose=*/false,
+        /*bTranspose=*/false, /*fullC=*/fullC,
+        /*lowD=*/false, /*weightA=*/0, /*dataflow=*/1);
+
     rewriter.create<memref::DeallocOp>(loc, bias);
     return success();
   }
@@ -285,6 +347,16 @@ public:
     MemRefType outputMatType = MemRefType::get(outputMatShape, outputElemType);
     Value bias = rewriter.create<memref::AllocOp>(loc, biasType);
     Value outputMat = rewriter.create<memref::AllocOp>(loc, outputMatType);
+    // Initialize bias to zero before tile_conv.
+    TypedAttr biasZeroAttr = rewriter.getI32IntegerAttr(0);
+    Type biasElemType = rewriter.getI32Type();
+    if (accType == "f32") {
+      biasZeroAttr = rewriter.getF32FloatAttr(0);
+      biasElemType = rewriter.getF32Type();
+    }
+    Value biasZero =
+        rewriter.create<arith::ConstantOp>(loc, biasElemType, biasZeroAttr);
+    rewriter.create<linalg::FillOp>(loc, biasZero, bias);
     TypedAttr outDimAttr = rewriter.getI64IntegerAttr(outputShape[2]);
     Value outDim = rewriter.create<arith::ConstantOp>(
         loc, rewriter.getI64Type(), outDimAttr);
@@ -522,6 +594,10 @@ public:
     Value input0 = inputs[0];
     Value input1 = inputs[1];
     Value output = batchMatMulOp.getOutputs()[0];
+    if (Value recovered = tryRecoverInt8Source(input0))
+      input0 = recovered;
+    if (Value recovered = tryRecoverInt8Source(input1))
+      input1 = recovered;
     MemRefType input0Type = dyn_cast<MemRefType>(input0.getType());
     MemRefType input1Type = dyn_cast<MemRefType>(input1.getType());
     MemRefType outputType = dyn_cast<MemRefType>(output.getType());
@@ -562,9 +638,34 @@ public:
         subOutput =
             rewriter.create<memref::CollapseShapeOp>(loc, subOutput, reassoc);
       }
-      SmallVector<Value> inputs = {subInput0, subInput1};
-      SmallVector<Value> output = {subOutput};
-      rewriter.create<linalg::MatmulOp>(batchMatMulOp.getLoc(), inputs, output);
+      // Set full_C=true when output is i32 so Gemmini DMA writes to DRAM.
+      // Previously this code created linalg.MatmulOp which went through
+      // MatmulLowering — but that never passed fullC, causing full_C=0
+      // and the 0x8000... scratchpad address segfault for batches 1+.
+      MemRefType subOutputType = dyn_cast<MemRefType>(subOutput.getType());
+      bool fullC = subOutputType.getElementType().getIntOrFloatBitWidth() == 32;
+
+      MemRefType subInput0Type = dyn_cast<MemRefType>(subInput0.getType());
+      MemRefType biasType =
+          MemRefType::get(subInput0Type.getShape(), rewriter.getI32Type());
+      TypedAttr fillOpInputAttr = rewriter.getI32IntegerAttr(0);
+      Value bias = rewriter.create<memref::AllocOp>(loc, biasType);
+      Value fillOpInputValue = rewriter.create<arith::ConstantOp>(
+          loc, rewriter.getI32Type(), fillOpInputAttr);
+      rewriter.create<linalg::FillOp>(loc, fillOpInputValue, bias);
+
+      llvm::APFloat scale1((float)1.0);
+      llvm::APFloat scale0((float)0.0);
+      rewriter.create<gemmini::TileMatMulOp>(
+          loc, subInput0, subInput1, subOutput, bias,
+          /*aScaleFactor=*/scale1, /*bScaleFactor=*/scale1,
+          /*dScaleFactor=*/scale1, /*act=*/0,
+          /*accScale=*/scale1, /*bertScale=*/scale0,
+          /*repeatingBias=*/false, /*aTranspose=*/false,
+          /*bTranspose=*/false, /*fullC=*/fullC,
+          /*lowD=*/false, /*weightA=*/0, /*dataflow=*/1);
+
+      rewriter.create<memref::DeallocOp>(loc, bias);
     }
     rewriter.eraseOp(batchMatMulOp.getOperation());
     return success();
@@ -586,6 +687,10 @@ public:
     Value input0 = inputs[0];
     Value input1 = inputs[1];
     Value output = batchMatMulTransBOp.getOutputs()[0];
+    if (Value recovered = tryRecoverInt8Source(input0))
+      input0 = recovered;
+    if (Value recovered = tryRecoverInt8Source(input1))
+      input1 = recovered;
     MemRefType input0Type = dyn_cast<MemRefType>(input0.getType());
     MemRefType input1Type = dyn_cast<MemRefType>(input1.getType());
     MemRefType outputType = dyn_cast<MemRefType>(output.getType());
@@ -651,13 +756,14 @@ public:
       rewriter.create<linalg::FillOp>(loc, fillOpInputValue, bias);
 
       // Create TileMatMulOp with bTranspose=true
+      bool fullC = outputType.getElementType().getIntOrFloatBitWidth() == 32;
       rewriter.create<gemmini::TileMatMulOp>(
           loc, subInput0, subInput1, subOutput, bias,
           /*aScaleFactor = */ scale1,
           /*bScaleFactor = */ scale1, /*dScaleFactor = */ scale1,
           /*act = */ 0, /*accScale = */ scale1, /*bertScale = */ scale0,
           /*repeatingBias = */ false, /*aTranspose = */ false,
-          /*bTranspose = */ true, /*fullC = */ false, /*lowD = */ false,
+          /*bTranspose = */ true, /*fullC = */ fullC, /*lowD = */ false,
           /*weightA = */ 0, /*dataflow = */ 1);
 
       rewriter.create<memref::DeallocOp>(loc, bias);
